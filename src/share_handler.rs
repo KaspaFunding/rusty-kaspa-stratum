@@ -847,7 +847,8 @@ impl ShareHandler {
                     let stales = *v.stale_shares.lock();
                     let invalids = *v.invalid_shares.lock();
                     let blocks = *v.blocks_found.lock();
-                    let uptime = format!("{:?}", v.start_time.elapsed());
+                    let uptime_secs = v.start_time.elapsed().as_secs_f64();
+                    let uptime = format!("{:.1}m", uptime_secs / 60.0);
                     let diff = *v.min_diff.lock();
 
                     let (spm, window_secs) = match *v.var_diff_start_time.lock() {
@@ -928,7 +929,10 @@ impl ShareHandler {
                         *overall.stale_shares.lock(), 
                         *overall.invalid_shares.lock()),
                     *overall.blocks_found.lock(),
-                    format!("{:?}", start.elapsed())
+                    {
+                        let overall_secs = start.elapsed().as_secs_f64();
+                        format!("{:.1}m", overall_secs / 60.0)
+                    }
                 );
             }
         });
