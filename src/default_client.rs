@@ -99,16 +99,18 @@ pub async fn handle_subscribe(
 
     // Check if this is a Bitmain miner - use same detection logic as assign_extranonce_for_miner
     // (case-insensitive matching for consistency)
-    let is_bitmain_flag = crate::miner_detection::is_bitmain(&remote_app);
-    tracing::debug!("[SUBSCRIBE] Detected miner type - Remote app: '{}', Is Bitmain: {}", remote_app, is_bitmain_flag);
+    let remote_app_lower = remote_app.to_lowercase();
+    let is_bitmain =
+        remote_app_lower.contains("godminer") || remote_app_lower.contains("bitmain") || remote_app_lower.contains("antminer");
+    tracing::debug!("[SUBSCRIBE] Detected miner type - Remote app: '{}', Is Bitmain: {}", remote_app, is_bitmain);
 
-    if is_bitmain_flag {
+    if is_bitmain {
         tracing::debug!("[SUBSCRIBE] ===== BITMAIN MINER DETECTED =====");
         tracing::debug!("[SUBSCRIBE] Bitmain requires extranonce in subscribe response");
         tracing::debug!("[SUBSCRIBE] Current extranonce: '{}' (length: {} bytes)", extranonce, extranonce.len() / 2);
     }
 
-    let response = if is_bitmain_flag {
+    let response = if is_bitmain {
         // Bitmain format - extranonce in subscribe response
         let extranonce2_size = 8 - (extranonce.len() / 2);
         tracing::debug!("[SUBSCRIBE] ===== USING BITMAIN SUBSCRIBE FORMAT FOR {} =====", ctx.remote_addr);
@@ -328,10 +330,12 @@ async fn send_extranonce(ctx: Arc<StratumContext>) -> Result<(), Box<dyn std::er
 
     // Bitmain requires extranonce2_size parameter - use same detection logic as assign_extranonce_for_miner
     // (case-insensitive matching for consistency)
-    let is_bitmain_flag = crate::miner_detection::is_bitmain(&remote_app);
-    tracing::debug!("[EXTRANONCE] Detected miner type - Remote app: '{}', Is Bitmain: {}", remote_app, is_bitmain_flag);
+    let remote_app_lower = remote_app.to_lowercase();
+    let is_bitmain =
+        remote_app_lower.contains("godminer") || remote_app_lower.contains("bitmain") || remote_app_lower.contains("antminer");
+    tracing::debug!("[EXTRANONCE] Detected miner type - Remote app: '{}', Is Bitmain: {}", remote_app, is_bitmain);
 
-    let params = if is_bitmain_flag {
+    let params = if is_bitmain {
         let extranonce2_size = 8 - (extranonce.len() / 2);
         tracing::debug!("[EXTRANONCE] ===== USING BITMAIN EXTRANONCE FORMAT FOR {} =====", ctx.remote_addr);
         tracing::debug!(
@@ -349,10 +353,9 @@ async fn send_extranonce(ctx: Arc<StratumContext>) -> Result<(), Box<dyn std::er
     };
 
     // IceRiver expects minimal notification format (method + params only, no id or jsonrpc)
-    // NOTE: This uses case-sensitive check to preserve exact existing behavior
-    let is_iceriver_flag = crate::miner_detection::is_iceriver_case_sensitive(&remote_app);
+    let is_iceriver = remote_app.contains("IceRiver");
 
-    if is_iceriver_flag {
+    if is_iceriver {
         tracing::debug!("[EXTRANONCE] Using minimal format for IceRiver (no id/jsonrpc)");
         ctx.send_notification("mining.set_extranonce", params.clone())
             .await

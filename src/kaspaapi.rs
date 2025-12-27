@@ -1,4 +1,3 @@
-use crate::constants::{BLOCK_TEMPLATE_MAX_RETRIES, RETRY_DELAY_BASE_MS};
 use crate::log_colors::LogColors;
 use crate::share_handler::KaspaApiTrait;
 use anyhow::{Context, Result};
@@ -6,16 +5,36 @@ use kaspa_addresses::Address;
 use kaspa_consensus_core::block::Block;
 use kaspa_grpc_client::GrpcClient;
 use kaspa_notify::{listener::ListenerId, scope::NewBlockTemplateScope};
+use kaspa_rpc_core::notify::mode::NotificationMode;
 use kaspa_rpc_core::{
-    api::rpc::RpcApi, GetBlockDagInfoRequest, GetBlockTemplateRequest, Notification, RpcRawBlock, SubmitBlockRequest,
-    SubmitBlockResponse,
+    api::rpc::RpcApi, GetBlockDagInfoRequest, GetBlockTemplateRequest, GetConnectedPeerInfoRequest, GetInfoRequest,
+    GetServerInfoRequest, Notification, RpcRawBlock, SubmitBlockRequest, SubmitBlockResponse,
 };
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+
+#[derive(Clone, Debug, Default)]
+pub struct NodeStatusSnapshot {
+    pub last_updated: Option<std::time::Instant>,
+    pub is_connected: bool,
+    pub is_synced: Option<bool>,
+    pub network_id: Option<String>,
+    pub server_version: Option<String>,
+    pub virtual_daa_score: Option<u64>,
+    pub block_count: Option<u64>,
+    pub header_count: Option<u64>,
+    pub difficulty: Option<f64>,
+    pub tip_hash: Option<String>,
+    pub peers: Option<usize>,
+    pub mempool_size: Option<u64>,
+}
+
+pub static NODE_STATUS: Lazy<Mutex<NodeStatusSnapshot>> = Lazy::new(|| Mutex::new(NodeStatusSnapshot::default()));
 
 /// Kaspa API client wrapper using RPC client
 /// Both use gRPC under the hood, but through an RPC client wrapper abstraction
@@ -39,8 +58,21 @@ impl KaspaApi {
         tracing::debug!("{} {} {}", LogColors::api("[API]"), LogColors::label("  - Address:"), &grpc_address);
         tracing::debug!("{} {} {}", LogColors::api("[API]"), LogColors::label("  - Protocol:"), "gRPC (via RPC client wrapper)");
 
-        // Connect to Kaspa node with grpc:// prefix
-        let client = Arc::new(GrpcClient::connect(grpc_address.clone()).await.context("Failed to connect to Kaspa node")?);
+        // Connect to Kaspa node with grpc:// prefix, using extended request timeout and reconnection support
+        let client = Arc::new(
+            GrpcClient::connect_with_args(
+                NotificationMode::Direct,
+                grpc_address.clone(),
+                None,
+                true,
+                None,
+                false,
+                Some(500_000),
+                Default::default(),
+            )
+            .await
+            .context("Failed to connect to Kaspa node")?,
+        );
 
         // Log successful connection (detailed logs moved to debug)
         tracing::debug!("{} {}", LogColors::api("[API]"), LogColors::block("✓ RPC Connection Established Successfully"));
@@ -86,17 +118,22 @@ impl KaspaApi {
             api_clone.start_stats_thread().await;
         });
 
+        // Start node status polling thread (for console status display)
+        let api_clone = Arc::clone(&api);
+        tokio::spawn(async move {
+            api_clone.start_node_status_thread().await;
+        });
+
         Ok(api)
     }
 
     /// Start network stats thread
-    /// Fetches network stats periodically and records them in Prometheus
+    /// Fetches network stats every 30 seconds and records them in Prometheus
     async fn start_stats_thread(self: Arc<Self>) {
         use crate::prom::record_network_stats;
         use kaspa_rpc_core::{EstimateNetworkHashesPerSecondRequest, GetBlockDagInfoRequest};
 
-        const NETWORK_STATS_INTERVAL: Duration = Duration::from_secs(30);
-        let mut interval = tokio::time::interval(NETWORK_STATS_INTERVAL);
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
 
@@ -137,6 +174,57 @@ impl KaspaApi {
 
             // Record network stats
             record_network_stats(hashrate_response.network_hashes_per_second, dag_response.block_count, dag_response.difficulty);
+        }
+    }
+
+    async fn start_node_status_thread(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+
+            let connected = self.client.is_connected();
+
+            let server_info_fut = self.client.get_server_info_call(None, GetServerInfoRequest {});
+            let dag_info_fut = self.client.get_block_dag_info_call(None, GetBlockDagInfoRequest {});
+            let peers_fut = self.client.get_connected_peer_info_call(None, GetConnectedPeerInfoRequest {});
+            let info_fut = self.client.get_info_call(None, GetInfoRequest {});
+
+            let (server_info, dag_info, peers_info, info_resp) = tokio::join!(server_info_fut, dag_info_fut, peers_fut, info_fut);
+
+            let mut snapshot = NODE_STATUS.lock();
+            snapshot.last_updated = Some(std::time::Instant::now());
+            snapshot.is_connected = connected;
+
+            if let Ok(server_info) = server_info {
+                snapshot.is_synced = Some(server_info.is_synced);
+                snapshot.network_id = Some(format!("{:?}", server_info.network_id));
+                snapshot.server_version = Some(server_info.server_version);
+                snapshot.virtual_daa_score = Some(server_info.virtual_daa_score);
+            }
+
+            if let Ok(dag) = dag_info {
+                snapshot.block_count = Some(dag.block_count);
+                snapshot.header_count = Some(dag.header_count);
+                snapshot.difficulty = Some(dag.difficulty);
+                snapshot.tip_hash = dag.tip_hashes.first().map(|h| format!("{}", h));
+                if snapshot.virtual_daa_score.is_none() {
+                    snapshot.virtual_daa_score = Some(dag.virtual_daa_score);
+                }
+                if snapshot.network_id.is_none() {
+                    snapshot.network_id = Some(format!("{:?}", dag.network));
+                }
+            }
+
+            if let Ok(peers) = peers_info {
+                snapshot.peers = Some(peers.peer_info.len());
+            }
+
+            if let Ok(info) = info_resp {
+                snapshot.mempool_size = Some(info.mempool_size);
+                if snapshot.server_version.is_none() {
+                    snapshot.server_version = Some(info.server_version);
+                }
+            }
         }
     }
 
@@ -299,8 +387,6 @@ impl KaspaApi {
 
     /// Wait for node to sync
     async fn wait_for_sync(&self, verbose: bool) -> Result<()> {
-        const SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-
         if verbose {
             tracing::debug!("checking kaspad sync state");
         }
@@ -323,7 +409,7 @@ impl KaspaApi {
             if verbose {
                 warn!("Kaspa is not synced, waiting for sync before starting bridge");
             }
-            sleep(SYNC_CHECK_INTERVAL).await;
+            sleep(Duration::from_secs(5)).await;
         }
 
         Ok(())
@@ -336,11 +422,12 @@ impl KaspaApi {
 
     /// Get block template for a client
     pub async fn get_block_template(&self, wallet_addr: &str, _remote_app: &str, _canxium_addr: &str) -> Result<Block> {
-        // Retry if we get "Odd number of digits" error
+        // Retry up to 3 times if we get "Odd number of digits" error
         // This error can occur if the block template has malformed hash fields
+        let max_retries = 3;
         let mut last_error = None;
 
-        for attempt in 0..BLOCK_TEMPLATE_MAX_RETRIES {
+        for attempt in 0..max_retries {
             // Parse wallet address each time (in case Address doesn't implement Clone)
             let address =
                 Address::try_from(wallet_addr).map_err(|e| anyhow::anyhow!("Could not decode address {}: {}", wallet_addr, e))?;
@@ -349,17 +436,12 @@ impl KaspaApi {
             let response = match self.client.get_block_template_call(None, GetBlockTemplateRequest::new(address, vec![])).await {
                 Ok(r) => r,
                 Err(e) => {
-                    if attempt < BLOCK_TEMPLATE_MAX_RETRIES - 1 {
-                        warn!(
-                            "Failed to get block template (attempt {}/{}): {}, retrying...",
-                            attempt + 1,
-                            BLOCK_TEMPLATE_MAX_RETRIES,
-                            e
-                        );
-                        sleep(Duration::from_millis(RETRY_DELAY_BASE_MS * (attempt + 1) as u64)).await;
+                    if attempt < max_retries - 1 {
+                        warn!("Failed to get block template (attempt {}/{}): {}, retrying...", attempt + 1, max_retries, e);
+                        sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
                         continue;
                     }
-                    return Err(anyhow::anyhow!("Failed to get block template after {} attempts: {}", BLOCK_TEMPLATE_MAX_RETRIES, e));
+                    return Err(anyhow::anyhow!("Failed to get block template after {} attempts: {}", max_retries, e));
                 }
             };
 
@@ -383,13 +465,13 @@ impl KaspaApi {
                         Err(error_str) => {
                             if error_str.contains("Odd number of digits") {
                                 last_error = Some(format!("Block has malformed hash field: {}", error_str));
-                                if attempt < BLOCK_TEMPLATE_MAX_RETRIES - 1 {
+                                if attempt < max_retries - 1 {
                                     warn!(
                                         "Block template has malformed hash field (attempt {}/{}), retrying...",
                                         attempt + 1,
-                                        BLOCK_TEMPLATE_MAX_RETRIES
+                                        max_retries
                                     );
-                                    sleep(Duration::from_millis(RETRY_DELAY_BASE_MS * (attempt + 1) as u64)).await;
+                                    sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
                                     continue;
                                 }
                             }
@@ -401,18 +483,18 @@ impl KaspaApi {
                 Err(e) => {
                     let error_str = format!("{:?}", e);
                     last_error = Some(error_str.clone());
-                    if error_str.contains("Odd number of digits") && attempt < BLOCK_TEMPLATE_MAX_RETRIES - 1 {
+                    if error_str.contains("Odd number of digits") && attempt < max_retries - 1 {
                         warn!(
                             "Block conversion failed with 'Odd number of digits' error (attempt {}/{}), retrying...",
                             attempt + 1,
-                            BLOCK_TEMPLATE_MAX_RETRIES
+                            max_retries
                         );
-                        sleep(Duration::from_millis(RETRY_DELAY_BASE_MS * (attempt + 1) as u64)).await;
+                        sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
                         continue;
                     }
                     // If the error contains "Odd number of digits", provide more context
                     if error_str.contains("Odd number of digits") {
-                        return Err(anyhow::anyhow!("Failed to convert RPC block to Block after {} attempts: {} - This usually indicates a malformed hash field in the block template from the Kaspa node. The block may have a hash with an odd-length hex string.", BLOCK_TEMPLATE_MAX_RETRIES, error_str));
+                        return Err(anyhow::anyhow!("Failed to convert RPC block to Block after {} attempts: {} - This usually indicates a malformed hash field in the block template from the Kaspa node. The block may have a hash with an odd-length hex string.", max_retries, error_str));
                     } else {
                         return Err(anyhow::anyhow!("Failed to convert RPC block to Block: {}", error_str));
                     }
@@ -421,7 +503,7 @@ impl KaspaApi {
         }
 
         // Should never reach here, but handle it just in case
-        Err(anyhow::anyhow!("Failed to get valid block template after {} attempts: {:?}", BLOCK_TEMPLATE_MAX_RETRIES, last_error))
+        Err(anyhow::anyhow!("Failed to get valid block template after {} attempts: {:?}", max_retries, last_error))
     }
 
     /// Get balances by addresses (for Prometheus metrics)
@@ -469,12 +551,11 @@ impl KaspaApi {
 
             loop {
                 // Check sync state and reconnect if needed
-                const RECONNECT_DELAY: Duration = Duration::from_secs(5);
                 if let Err(e) = api_clone.wait_for_sync(false).await {
                     error!("error checking kaspad sync state, attempting reconnect: {}", e);
                     // Note: gRPC client handles reconnection automatically, but we log it
                     // In Go, reconnect() is called explicitly, but Rust gRPC handles it
-                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                     restart_channel = true;
                 }
 

@@ -7,7 +7,7 @@ target/
 .github/
 README.md
 vardiff_sample.ps1
-config.yaml
+config.example.multi-instance.yaml
 
 .idea/
 .vscode/

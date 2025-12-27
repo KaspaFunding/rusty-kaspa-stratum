@@ -6,16 +6,18 @@ WORKDIR /usr/src/rustbridge
 
 COPY Cargo.toml Cargo.lock ./
 
+COPY config.yaml ./
+
 # Create a dummy src/main.rs to build only the dependencies.
 # This avoids rebuilding all dependencies when only the source code changes.
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
+RUN cargo build --release --bin stratum-bridge
 
 # Dependencies are now cached, we can remove the dummy source and build the real one
-RUN rm -f target/release/deps/rustbridge*
+RUN rm -f target/release/deps/stratum_bridge* target/release/deps/kaspa_stratum_bridge*
 COPY src ./src
 
-RUN cargo build --release
+RUN cargo build --release --bin stratum-bridge
 
 FROM alpine:latest
 
@@ -29,8 +31,10 @@ LABEL org.opencontainers.image.title="Kaspa Rust Stratum Bridge" \
     org.opencontainers.image.licenses="ISC"
 
 # Copy the binary from the builder stage
-COPY --from=builder /usr/src/rustbridge/target/release/rustbridge .
+COPY --from=builder /usr/src/rustbridge/target/release/stratum-bridge .
 COPY LICENSE .
+
+COPY --from=builder /usr/src/rustbridge/config.yaml ./config.yaml
 
 # Expose the default stratum and prometheus ports from the config
 # Stratum ports
@@ -45,4 +49,5 @@ EXPOSE 2116
 EXPOSE 2117
 
 # Set the entrypoint to run the bridge
-ENTRYPOINT ["./rustbridge"]
+ENTRYPOINT ["./stratum-bridge", "--config", "/app/config.yaml", "--node-mode", "external"]
+

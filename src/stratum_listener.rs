@@ -1,4 +1,3 @@
-use crate::constants::{READ_BUFFER_SIZE, READ_TIMEOUT};
 use crate::jsonrpc_event::JsonRpcEvent;
 use crate::log_colors::LogColors;
 use crate::stratum_context::StratumContext;
@@ -163,7 +162,7 @@ impl StratumListener {
     /// Spawn a client listener task
     async fn spawn_client_listener(ctx: Arc<StratumContext>, handler_map: &Arc<HashMap<String, EventHandler>>) {
         tracing::debug!("[CLIENT_LISTENER] Starting client listener for {}:{}", ctx.remote_addr, ctx.remote_port);
-        let mut buffer = [0u8; READ_BUFFER_SIZE];
+        let mut buffer = [0u8; 1024];
         let mut line_buffer = String::new();
         let mut first_message = true;
 
@@ -182,7 +181,7 @@ impl StratumListener {
 
             let read_result = if let Some(mut read_half) = read_half_opt {
                 // Set read deadline
-                let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
                 let result = tokio::time::timeout_at(deadline, read_half.read(&mut buffer)).await;
 
@@ -765,7 +764,7 @@ impl StratumListener {
                 }
                 Err(_) => {
                     // Timeout - continue
-                    tokio::time::sleep(crate::constants::SOCKET_WAIT_DELAY).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
             }

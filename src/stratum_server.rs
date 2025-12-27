@@ -167,16 +167,13 @@ pub async fn listen_and_serve<T: KaspaApiTrait + Send + Sync + 'static>(
     // Start vardiff thread if enabled
     if config.var_diff {
         let shares_per_min = if config.shares_per_min > 0 { config.shares_per_min } else { 20 };
-
-        // Expose target shares-per-minute to the stats printer so it can
-        // display VarDiff columns (diff / spm / target / trend / status)
-        share_handler.set_target_spm(shares_per_min as f64);
         share_handler.start_vardiff_thread(shares_per_min, config.var_diff_stats, config.pow2_clamp);
     }
 
     // Start stats printing thread if enabled
     if config.print_stats {
-        share_handler.start_print_stats_thread();
+        let shares_per_min = if config.shares_per_min > 0 { config.shares_per_min } else { 20 };
+        share_handler.start_print_stats_thread(shares_per_min);
     }
 
     // Start stats pruning thread
